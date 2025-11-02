@@ -1742,12 +1742,14 @@ func (s *server) SendLocation() http.HandlerFunc {
 	}
 }
 
-// Sends Buttons (Native Flow / InteractiveMessage)
+// Sends Buttons (ButtonsMessage ou TemplateMessage)
+// - quick_reply => ButtonsMessage
+// - url/call (ou misto) => TemplateMessage (Hydrated)
 func (s *server) SendButtons() http.HandlerFunc {
 
 	type Btn struct {
 		Type        string `json:"type"`                   // quick_reply | url | call
-		DisplayText string `json:"displayText,omitempty"`  // botão exibido
+		DisplayText string `json:"displayText,omitempty"`  // rótulo do botão
 		Id          string `json:"id,omitempty"`           // só p/ quick_reply
 		URL         string `json:"url,omitempty"`          // só p/ url
 		PhoneNumber string `json:"phoneNumber,omitempty"`  // só p/ call
@@ -1764,7 +1766,8 @@ func (s *server) SendButtons() http.HandlerFunc {
 
 	return func(w http.ResponseWriter, r *http.Request) {
 		txtid := r.Context().Value("userinfo").(Values).Get("Id")
-		if clientManager.GetWhatsmeowClient(txtid) == nil {
+		cl := clientManager.GetWhatsmeowClient(txtid)
+		if cl == nil {
 			s.Respond(w, r, http.StatusInternalServerError, errors.New("no session"))
 			return
 		}
@@ -1786,108 +1789,152 @@ func (s *server) SendButtons() http.HandlerFunc {
 		}
 		msgid := in.Idsafe
 		if msgid == "" {
-			msgid = clientManager.GetWhatsmeowClient(txtid).GenerateMessageID()
+			msgid = cl.GenerateMessageID()
 		}
 
-		// Monta NativeFlow buttons a partir do “estilo Baileys”
-		var nfButtons []*waE2E.InteractiveMessage_NativeFlowMessage_Button
+		hasURLorCall := false
 		for _, b := range in.Btns {
-			switch b.Type {
-			case "quick_reply":
-				if b.DisplayText == "" {
-					continue
-				}
-				if b.Id == "" {
-					b.Id = b.DisplayText
-				}
-				params := map[string]any{
-					"display_text": b.DisplayText,
-					"id":           b.Id,
-				}
-				raw, _ := json.Marshal(params)
-				nfButtons = append(nfButtons, &waE2E.InteractiveMessage_NativeFlowMessage_Button{
-					Name:             proto.String("quick_reply"),
-					ButtonParamsJSON: proto.String(string(raw)),
-				})
-			case "url":
-				if b.DisplayText == "" || b.URL == "" {
-					continue
-				}
-				params := map[string]any{
-					"display_text": b.DisplayText,
-					"url":          b.URL,
-					"merchant_url": b.URL,
-				}
-				raw, _ := json.Marshal(params)
-				nfButtons = append(nfButtons, &waE2E.InteractiveMessage_NativeFlowMessage_Button{
-					Name:             proto.String("cta_url"),
-					ButtonParamsJSON: proto.String(string(raw)),
-				})
-			case "call":
-				if b.DisplayText == "" || b.PhoneNumber == "" {
-					continue
-				}
-				params := map[string]any{
-					"display_text": b.DisplayText,
-					"phone_number": b.PhoneNumber,
-				}
-				raw, _ := json.Marshal(params)
-				nfButtons = append(nfButtons, &waE2E.InteractiveMessage_NativeFlowMessage_Button{
-					Name:             proto.String("cta_call"),
-					ButtonParamsJSON: proto.String(string(raw)),
-				})
-			}
-		}
-		if len(nfButtons) == 0 {
-			s.Respond(w, r, http.StatusBadRequest, errors.New("no valid buttons"))
-			return
-		}
-
-		intMsg := &waE2E.InteractiveMessage{
-			Body: &waE2E.InteractiveMessage_Body{
-				Text: proto.String(in.Body),
-			},
-			NativeFlowMessage: &waE2E.InteractiveMessage_NativeFlowMessage{
-				Buttons: nfButtons,
-			},
-		}
-		if in.Header != "" {
-			intMsg.Header = &waE2E.InteractiveMessage_Header{
-				Title: proto.String(in.Header),
-				// Pode-se usar `HasMedia`/`Thumbnail` se quiser header multimídia
-			}
-		}
-		if in.Footer != "" {
-			intMsg.Footer = &waE2E.InteractiveMessage_Footer{
-				Text: proto.String(in.Footer),
+			if b.Type == "url" || b.Type == "call" {
+				hasURLorCall = true
+				break
 			}
 		}
 
-		// Wrap em ViewOnceMessage (ajuda a evitar 405 em alguns devices)
-		wire := &waE2E.Message{
+		var wire *waE2E.Message
+
+		if !hasURLorCall {
+			// ---- ButtonsMessage (apenas quick_reply) ----
+			var btns []*waE2E.ButtonsMessage_Button
+			for _, b := range in.Btns {
+				if b.Type != "quick_reply" || b.DisplayText == "" {
+					continue
+				}
+				id := b.Id
+				if id == "" {
+					id = b.DisplayText
+				}
+				btns = append(btns, &waE2E.ButtonsMessage_Button{
+					ButtonID: proto.String(id),
+					ButtonText: &waE2E.ButtonsMessage_Button_ButtonText{
+						DisplayText: proto.String(b.DisplayText),
+					},
+					Type: waE2E.ButtonsMessage_Button_REPLY.Enum(),
+				})
+			}
+			if len(btns) == 0 {
+				s.Respond(w, r, http.StatusBadRequest, errors.New("no valid quick_reply buttons"))
+				return
+			}
+
+			msg := &waE2E.ButtonsMessage{
+				ContentText: proto.String(in.Body),
+				Buttons:     btns,
+				HeaderType:  waE2E.ButtonsMessage_TEXT.Enum(),
+			}
+			if in.Header != "" {
+				// ButtonsMessage não tem "title" separado para header textual,
+				// costuma-se incluir header no ContentText ou usar HeaderType TEXT + texto no Header?
+				// Para máxima compatibilidade, mantemos tudo em ContentText e colocamos footer abaixo.
+				msg.ContentText = proto.String(in.Header + "\n\n" + in.Body)
+			}
+			if in.Footer != "" {
+				msg.FooterText = proto.String(in.Footer)
+			}
+
+			wire = &waE2E.Message{ButtonsMessage: msg}
+
+		} else {
+			// ---- TemplateMessage (Hydrated) para url/call (+ quick_reply se quiser misto) ----
+			var hydratedButtons []*waE2E.HydratedTemplate_HydratedButton
+			for _, b := range in.Btns {
+				switch b.Type {
+				case "quick_reply":
+					if b.DisplayText == "" {
+						continue
+					}
+					id := b.Id
+					if id == "" {
+						id = b.DisplayText
+					}
+					hydratedButtons = append(hydratedButtons, &waE2E.HydratedTemplate_HydratedButton{
+						Index: proto.Uint32(uint32(len(hydratedButtons))),
+						HydratedButton: &waE2E.HydratedTemplate_HydratedButton_QuickReplyButton{
+							QuickReplyButton: &waE2E.HydratedTemplate_HydratedQuickReplyButton{
+								DisplayText: proto.String(b.DisplayText),
+								Id:          proto.String(id),
+							},
+						},
+					})
+				case "url":
+					if b.DisplayText == "" || b.URL == "" {
+						continue
+					}
+					hydratedButtons = append(hydratedButtons, &waE2E.HydratedTemplate_HydratedButton{
+						Index: proto.Uint32(uint32(len(hydratedButtons))),
+						HydratedButton: &waE2E.HydratedTemplate_HydratedButton_UrlButton{
+							UrlButton: &waE2E.HydratedTemplate_HydratedURLButton{
+								DisplayText: proto.String(b.DisplayText),
+								Url:         proto.String(b.URL),
+							},
+						},
+					})
+				case "call":
+					if b.DisplayText == "" || b.PhoneNumber == "" {
+						continue
+					}
+					hydratedButtons = append(hydratedButtons, &waE2E.HydratedTemplate_HydratedButton{
+						Index: proto.Uint32(uint32(len(hydratedButtons))),
+						HydratedButton: &waE2E.HydratedTemplate_HydratedButton_CallButton{
+							CallButton: &waE2E.HydratedTemplate_HydratedCallButton{
+								DisplayText: proto.String(b.DisplayText),
+								PhoneNumber: proto.String(b.PhoneNumber),
+							},
+						},
+					})
+				}
+			}
+			if len(hydratedButtons) == 0 {
+				s.Respond(w, r, http.StatusBadRequest, errors.New("no valid url/call/quick_reply buttons"))
+				return
+			}
+
+			ht := &waE2E.HydratedTemplate{
+				HydratedButtons:    hydratedButtons,
+				HydratedContentText: proto.String(in.Body),
+			}
+			if in.Header != "" {
+				ht.HydratedTitleText = proto.String(in.Header)
+			}
+			if in.Footer != "" {
+				ht.HydratedFooterText = proto.String(in.Footer)
+			}
+
+			tmpl := &waE2E.TemplateMessage{
+				HydratedTemplate: ht,
+			}
+
+			wire = &waE2E.Message{TemplateMessage: tmpl}
+		}
+
+		// Opcional: envolver em ViewOnceMessage para contornar 405 em alguns devices
+		wire = &waE2E.Message{
 			ViewOnceMessage: &waE2E.FutureProofMessage{
-				Message: &waE2E.Message{
-					InteractiveMessage: intMsg,
-				},
+				Message: wire,
 			},
 		}
 
-		resp, err := clientManager.GetWhatsmeowClient(txtid).SendMessage(
-			context.Background(), recipient, wire, whatsmeow.SendRequestExtra{ID: msgid},
-		)
+		resp, err := cl.SendMessage(context.Background(), recipient, wire, whatsmeow.SendRequestExtra{ID: msgid})
 		if err != nil {
 			s.Respond(w, r, http.StatusInternalServerError, fmt.Errorf("error sending buttons: %w", err))
 			return
 		}
-
-		response := map[string]any{"Details": "Sent", "Timestamp": resp.Timestamp.Unix(), "Id": msgid}
-		raw, _ := json.Marshal(response)
+		out := map[string]any{"Details": "Sent", "Timestamp": resp.Timestamp.Unix(), "Id": msgid}
+		raw, _ := json.Marshal(out)
 		s.Respond(w, r, http.StatusOK, string(raw))
 	}
 }
 
-
-// SendList (Native Flow single_select / InteractiveMessage)
+// SendList (ListMessage "clássico", sem NativeFlow)
 func (s *server) SendList() http.HandlerFunc {
 
 	type listItem struct {
@@ -1903,7 +1950,7 @@ func (s *server) SendList() http.HandlerFunc {
 		Phone      string     `json:"Phone"`
 		ButtonText string     `json:"ButtonText"`
 		Desc       string     `json:"Desc"`
-		TopText    string     `json:"TopText"`    // vira header.title
+		TopText    string     `json:"TopText"`    // header/title
 		Sections   []section  `json:"Sections"`   // preferencial
 		List       []listItem `json:"List"`       // compat: 1 seção
 		FooterText string     `json:"FooterText"` // opcional
@@ -1912,7 +1959,8 @@ func (s *server) SendList() http.HandlerFunc {
 
 	return func(w http.ResponseWriter, r *http.Request) {
 		txtid := r.Context().Value("userinfo").(Values).Get("Id")
-		if clientManager.GetWhatsmeowClient(txtid) == nil {
+		cl := clientManager.GetWhatsmeowClient(txtid)
+		if cl == nil {
 			s.Respond(w, r, http.StatusInternalServerError, errors.New("no session"))
 			return
 		}
@@ -1926,6 +1974,7 @@ func (s *server) SendList() http.HandlerFunc {
 			s.Respond(w, r, http.StatusBadRequest, errors.New("missing required fields: Phone, ButtonText, Desc"))
 			return
 		}
+
 		recipient, ok := parseJID(req.Phone)
 		if !ok {
 			s.Respond(w, r, http.StatusBadRequest, errors.New("could not parse Phone"))
@@ -1933,103 +1982,72 @@ func (s *server) SendList() http.HandlerFunc {
 		}
 		msgid := req.Id
 		if msgid == "" {
-			msgid = clientManager.GetWhatsmeowClient(txtid).GenerateMessageID()
+			msgid = cl.GenerateMessageID()
 		}
 
-		// Monta estrutura de sections/rows para o JSON do single_select
-		var sections []map[string]any
-		if len(req.Sections) > 0 {
-			for _, sct := range req.Sections {
-				var rows []map[string]any
-				for _, it := range sct.Rows {
-					id := it.RowId
-					if id == "" {
-						id = it.Title
-					}
-					rows = append(rows, map[string]any{
-						"title":       it.Title,
-						"id":          id,
-						"description": it.Desc,
-					})
-				}
-				sections = append(sections, map[string]any{
-					"title": sct.Title,
-					"rows":  rows,
-				})
-			}
-		} else if len(req.List) > 0 {
-			var rows []map[string]any
-			for _, it := range req.List {
+		// Monta sections/rows para ListMessage
+		var sections []*waE2E.ListMessage_Section
+		buildRows := func(items []listItem) []*waE2E.ListMessage_Row {
+			var rows []*waE2E.ListMessage_Row
+			for _, it := range items {
 				id := it.RowId
 				if id == "" {
 					id = it.Title
 				}
-				rows = append(rows, map[string]any{
-					"title":       it.Title,
-					"id":          id,
-					"description": it.Desc,
+				rows = append(rows, &waE2E.ListMessage_Row{
+					Title:       proto.String(it.Title),
+					Description: proto.String(it.Desc),
+					RowId:       proto.String(id),
 				})
 			}
+			return rows
+		}
+
+		if len(req.Sections) > 0 {
+			for _, sct := range req.Sections {
+				sections = append(sections, &waE2E.ListMessage_Section{
+					Title: proto.String(sct.Title),
+					Rows:  buildRows(sct.Rows),
+				})
+			}
+		} else if len(req.List) > 0 {
 			title := req.TopText
 			if title == "" {
 				title = "Menu"
 			}
-			sections = append(sections, map[string]any{
-				"title": title,
-				"rows":  rows,
+			sections = append(sections, &waE2E.ListMessage_Section{
+				Title: proto.String(title),
+				Rows:  buildRows(req.List),
 			})
 		} else {
 			s.Respond(w, r, http.StatusBadRequest, errors.New("no section or list provided"))
 			return
 		}
 
-		// ButtonParams para single_select (estilo Baileys)
-		params := map[string]any{
-			"title":    req.ButtonText, // rótulo do botão principal
-			"sections": sections,
-		}
-		paramsRaw, _ := json.Marshal(params)
-
-		intMsg := &waE2E.InteractiveMessage{
-			Body: &waE2E.InteractiveMessage_Body{
-				Text: proto.String(req.Desc),
-			},
-			NativeFlowMessage: &waE2E.InteractiveMessage_NativeFlowMessage{
-				Buttons: []*waE2E.InteractiveMessage_NativeFlowMessage_Button{
-					{
-						Name:             proto.String("single_select"),
-						ButtonParamsJSON: proto.String(string(paramsRaw)),
-					},
-				},
-			},
-		}
-		if req.TopText != "" {
-			intMsg.Header = &waE2E.InteractiveMessage_Header{
-				Title: proto.String(req.TopText),
-			}
+		lm := &waE2E.ListMessage{
+			Title:       proto.String(req.TopText),     // Header/title
+			Description: proto.String(req.Desc),        // texto do corpo
+			ButtonText:  proto.String(req.ButtonText),  // rótulo do botão que abre a lista
+			Sections:    sections,
 		}
 		if req.FooterText != "" {
-			intMsg.Footer = &waE2E.InteractiveMessage_Footer{
-				Text: proto.String(req.FooterText),
-			}
+			lm.FooterText = proto.String(req.FooterText)
 		}
 
-		wire := &waE2E.Message{
+		wire := &waE2E.Message{ListMessage: lm}
+
+		// Opcional: envolver em ViewOnceMessage (alguns devices)
+		wire = &waE2E.Message{
 			ViewOnceMessage: &waE2E.FutureProofMessage{
-				Message: &waE2E.Message{
-					InteractiveMessage: intMsg,
-				},
+				Message: wire,
 			},
 		}
 
-		resp, err := clientManager.GetWhatsmeowClient(txtid).SendMessage(
-			context.Background(), recipient, wire, whatsmeow.SendRequestExtra{ID: msgid},
-		)
+		resp, err := cl.SendMessage(context.Background(), recipient, wire, whatsmeow.SendRequestExtra{ID: msgid})
 		if err != nil {
 			s.Respond(w, r, http.StatusInternalServerError, fmt.Errorf("error sending list: %w", err))
 			return
 		}
-
 		out := map[string]any{"Details": "Sent", "Timestamp": resp.Timestamp.Unix(), "Id": msgid}
 		raw, _ := json.Marshal(out)
 		s.Respond(w, r, http.StatusOK, string(raw))
