@@ -1742,16 +1742,15 @@ func (s *server) SendLocation() http.HandlerFunc {
 	}
 }
 
-// Sends Buttons (not implemented, does not work)
 // Sends Buttons (Native Flow / InteractiveMessage)
 func (s *server) SendButtons() http.HandlerFunc {
 
 	type Btn struct {
-		Type        string `json:"type"`                  // quick_reply | url | call
-		DisplayText string `json:"displayText,omitempty"`// botão exibido
-		Id          string `json:"id,omitempty"`          // só p/ quick_reply
-		URL         string `json:"url,omitempty"`         // só p/ url
-		PhoneNumber string `json:"phoneNumber,omitempty"` // só p/ call
+		Type        string `json:"type"`                   // quick_reply | url | call
+		DisplayText string `json:"displayText,omitempty"`  // botão exibido
+		Id          string `json:"id,omitempty"`           // só p/ quick_reply
+		URL         string `json:"url,omitempty"`          // só p/ url
+		PhoneNumber string `json:"phoneNumber,omitempty"`  // só p/ call
 	}
 
 	type reqStruct struct {
@@ -1791,7 +1790,7 @@ func (s *server) SendButtons() http.HandlerFunc {
 		}
 
 		// Monta NativeFlow buttons a partir do “estilo Baileys”
-		var nfButtons []*waE2E.NativeFlowMessage_Button
+		var nfButtons []*waE2E.InteractiveMessage_NativeFlowMessage_Button
 		for _, b := range in.Btns {
 			switch b.Type {
 			case "quick_reply":
@@ -1806,7 +1805,7 @@ func (s *server) SendButtons() http.HandlerFunc {
 					"id":           b.Id,
 				}
 				raw, _ := json.Marshal(params)
-				nfButtons = append(nfButtons, &waE2E.NativeFlowMessage_Button{
+				nfButtons = append(nfButtons, &waE2E.InteractiveMessage_NativeFlowMessage_Button{
 					Name:             proto.String("quick_reply"),
 					ButtonParamsJSON: proto.String(string(raw)),
 				})
@@ -1820,7 +1819,7 @@ func (s *server) SendButtons() http.HandlerFunc {
 					"merchant_url": b.URL,
 				}
 				raw, _ := json.Marshal(params)
-				nfButtons = append(nfButtons, &waE2E.NativeFlowMessage_Button{
+				nfButtons = append(nfButtons, &waE2E.InteractiveMessage_NativeFlowMessage_Button{
 					Name:             proto.String("cta_url"),
 					ButtonParamsJSON: proto.String(string(raw)),
 				})
@@ -1829,11 +1828,11 @@ func (s *server) SendButtons() http.HandlerFunc {
 					continue
 				}
 				params := map[string]any{
-					"display_text":  b.DisplayText,
-					"phone_number":  b.PhoneNumber,
+					"display_text": b.DisplayText,
+					"phone_number": b.PhoneNumber,
 				}
 				raw, _ := json.Marshal(params)
-				nfButtons = append(nfButtons, &waE2E.NativeFlowMessage_Button{
+				nfButtons = append(nfButtons, &waE2E.InteractiveMessage_NativeFlowMessage_Button{
 					Name:             proto.String("cta_call"),
 					ButtonParamsJSON: proto.String(string(raw)),
 				})
@@ -1848,7 +1847,7 @@ func (s *server) SendButtons() http.HandlerFunc {
 			Body: &waE2E.InteractiveMessage_Body{
 				Text: proto.String(in.Body),
 			},
-			NativeFlowMessage: &waE2E.NativeFlowMessage{
+			NativeFlowMessage: &waE2E.InteractiveMessage_NativeFlowMessage{
 				Buttons: nfButtons,
 			},
 		}
@@ -1995,8 +1994,8 @@ func (s *server) SendList() http.HandlerFunc {
 			Body: &waE2E.InteractiveMessage_Body{
 				Text: proto.String(req.Desc),
 			},
-			NativeFlowMessage: &waE2E.NativeFlowMessage{
-				Buttons: []*waE2E.NativeFlowMessage_Button{
+			NativeFlowMessage: &waE2E.InteractiveMessage_NativeFlowMessage{
+				Buttons: []*waE2E.InteractiveMessage_NativeFlowMessage_Button{
 					{
 						Name:             proto.String("single_select"),
 						ButtonParamsJSON: proto.String(string(paramsRaw)),
