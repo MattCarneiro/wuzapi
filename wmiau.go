@@ -26,11 +26,11 @@ import (
 	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/proto/waCompanionReg"
 	"go.mau.fi/whatsmeow/store"
-	"google.golang.org/protobuf/proto"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waProto "go.mau.fi/whatsmeow/proto/waE2E" // alias usado nos exemplos
 	waLog "go.mau.fi/whatsmeow/util/log"
+	"google.golang.org/protobuf/proto"
 	"golang.org/x/net/proxy"
 )
 
@@ -765,7 +765,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 	case *events.Message:
 
 				// [ADD] --- Captura de respostas interativas (botões e listas) ---
-		if br := evt.Message.GetButtonReplyMessage(); br != nil {
+		if br := evt.Message.GetButtonsResponseMessage(); br != nil {
 			// ButtonReplyMessage
 			post := map[string]interface{}{
 				"type":            "InteractiveReply",
@@ -775,30 +775,33 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 				"sender":          evt.Info.Sender.String(),
 				"timestamp":       evt.Info.Timestamp,
 				// campos úteis do proto
-				"selectedId":        br.GetSelectedId(),
+				"selectedButtonId":       br.GetSelectedButtonId(),
 				"selectedDisplay":   br.GetSelectedDisplayText(),
 			}
 			// se desejar manter padrão, reuse sendEventWithWebHook
 			sendEventWithWebHook(mycli, post, "")
 		}
 
-		if lr := evt.Message.GetListResponseMessage(); lr != nil {
-			// ListResponseMessage (SingleSelect)
-			sel := lr.GetSingleSelectReply()
-			post := map[string]interface{}{
-				"type":            "InteractiveReply",
-				"interactiveType": "list",
-				"messageID":       evt.Info.ID,
-				"chat":            evt.Info.Chat.String(),
-				"sender":          evt.Info.Sender.String(),
-				"timestamp":       evt.Info.Timestamp,
-				// campos úteis do proto
-				"listTitle":        lr.GetTitle(),
-				"selectedRowId":    sel.GetSelectedRowId(),
-				"selectedRowTitle": sel.GetTitle(),
-			}
-			sendEventWithWebHook(mycli, post, "")
-		}
+	if lr := evt.Message.GetListResponseMessage(); lr != nil {
+    // ListResponseMessage (SingleSelect) - nil-safe
+    var selectedRowID, selectedRowTitle string
+    if sel := lr.GetSingleSelectReply(); sel != nil {
+        selectedRowID = sel.GetSelectedRowId()
+        selectedRowTitle = sel.GetTitle()
+    }
+    post := map[string]interface{}{
+        "type":              "InteractiveReply",
+        "interactiveType":   "list",
+        "messageID":         evt.Info.ID,
+        "chat":              evt.Info.Chat.String(),
+        "sender":            evt.Info.Sender.String(),
+        "timestamp":         evt.Info.Timestamp,
+        "listTitle":         lr.GetTitle(),
+        "selectedRowId":     selectedRowID,
+        "selectedRowTitle":  selectedRowTitle,
+    }
+    sendEventWithWebHook(mycli, post, "")
+}
 
 		var s3Config struct {
 			Enabled       string `db:"s3_enabled"`
