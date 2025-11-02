@@ -26,8 +26,10 @@ import (
 	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/proto/waCompanionReg"
 	"go.mau.fi/whatsmeow/store"
+	"google.golang.org/protobuf/proto"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
+	waProto "go.mau.fi/whatsmeow/proto/waE2E" // alias usado nos exemplos
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"golang.org/x/net/proxy"
 )
@@ -41,6 +43,114 @@ type MyClient struct {
 	subscriptions  []string
 	db             *sqlx.DB
 	s              *server
+}
+
+// [ADD] --- Payloads de conveniência para envio de interativos ---
+type ButtonItem struct {
+	ID    string `json:"id"`
+	Title string `json:"title"`
+}
+
+type ButtonsPayload struct {
+	Text    string       `json:"text"`
+	Footer  string       `json:"footer,omitempty"`
+	Buttons []ButtonItem `json:"buttons"` // max 3 no cliente oficial
+}
+
+type ListRow struct {
+	ID          string `json:"id"`
+	Title       string `json:"title"`
+	Description string `json:"description,omitempty"`
+}
+type ListSection struct {
+	Title string    `json:"title,omitempty"`
+	Rows  []ListRow `json:"rows"`
+}
+type ListPayload struct {
+	Title       string        `json:"title,omitempty"`       // título no topo (opcional)
+	Description string        `json:"description,omitempty"` // subtítulo
+	ButtonText  string        `json:"buttonText"`            // texto do botão que abre a lista
+	Sections    []ListSection `json:"sections"`              // 1..N sections, cada uma com rows
+	Footer      string        `json:"footer,omitempty"`
+}
+
+// [ADD] --- Helpers para montar mensagens proto ---
+func buildButtonsMessage(p ButtonsPayload) *waProto.ButtonsMessage {
+	btns := make([]*waProto.ButtonsMessage_Button, 0, len(p.Buttons))
+	for _, b := range p.Buttons {
+		btns = append(btns, &waProto.ButtonsMessage_Button{
+			ButtonId: proto.String(b.ID),
+			ButtonText: &waProto.ButtonsMessage_Button_ButtonText{
+				DisplayText: proto.String(b.Title),
+			},
+			Type: waProto.ButtonsMessage_Button_RESPONSE.Enum(),
+		})
+	}
+	return &waProto.ButtonsMessage{
+		ContentText: proto.String(p.Text),
+		FooterText:  proto.String(p.Footer),
+		Buttons:     btns,
+		HeaderType:  waProto.ButtonsMessage_EMPTY.Enum(),
+	}
+}
+
+func buildListMessage(p ListPayload) *waProto.ListMessage {
+	secs := make([]*waProto.ListMessage_Section, 0, len(p.Sections))
+	for _, s := range p.Sections {
+		rows := make([]*waProto.ListMessage_Row, 0, len(s.Rows))
+		for _, r := range s.Rows {
+			rows = append(rows, &waProto.ListMessage_Row{
+				RowId:       proto.String(r.ID),
+				Title:       proto.String(r.Title),
+				Description: proto.String(r.Description),
+			})
+		}
+		secs = append(secs, &waProto.ListMessage_Section{
+			Title: proto.String(s.Title),
+			Rows:  rows,
+		})
+	}
+	return &waProto.ListMessage{
+		Title:       proto.String(p.Title),
+		Description: proto.String(p.Description),
+		ButtonText:  proto.String(p.ButtonText),
+		Sections:    secs,
+		FooterText:  proto.String(p.Footer),
+	}
+}
+
+// [ADD] --- Funções públicas para envio (expostas via server) ---
+// Observação: elas pegam o MyClient pelo clientManager para a userID da instância.
+func (s *server) SendInteractiveButtons(userID string, jidStr string, payload ButtonsPayload) error {
+	mycli := clientManager.GetMyClient(userID)
+	if mycli == nil || mycli.WAClient == nil {
+		return fmt.Errorf("whatsmeow client not found for userID=%s", userID)
+	}
+	jid, ok := parseJID(jidStr)
+	if !ok {
+		return fmt.Errorf("invalid JID: %s", jidStr)
+	}
+	msg := &waProto.Message{
+		ButtonsMessage: buildButtonsMessage(payload),
+	}
+	_, err := mycli.WAClient.SendMessage(context.Background(), jid, msg)
+	return err
+}
+
+func (s *server) SendInteractiveList(userID string, jidStr string, payload ListPayload) error {
+	mycli := clientManager.GetMyClient(userID)
+	if mycli == nil || mycli.WAClient == nil {
+		return fmt.Errorf("whatsmeow client not found for userID=%s", userID)
+	}
+	jid, ok := parseJID(jidStr)
+	if !ok {
+		return fmt.Errorf("invalid JID: %s", jidStr)
+	}
+	msg := &waProto.Message{
+		ListMessage: buildListMessage(payload),
+	}
+	_, err := mycli.WAClient.SendMessage(context.Background(), jid, msg)
+	return err
 }
 
 func sendToGlobalWebHook(jsonData []byte, token string, userID string) {
@@ -653,6 +763,42 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		log.Info().Msg("Received StreamReplaced event")
 		return
 	case *events.Message:
+
+				// [ADD] --- Captura de respostas interativas (botões e listas) ---
+		if br := evt.Message.GetButtonReplyMessage(); br != nil {
+			// ButtonReplyMessage
+			post := map[string]interface{}{
+				"type":            "InteractiveReply",
+				"interactiveType": "button",
+				"messageID":       evt.Info.ID,
+				"chat":            evt.Info.Chat.String(),
+				"sender":          evt.Info.Sender.String(),
+				"timestamp":       evt.Info.Timestamp,
+				// campos úteis do proto
+				"selectedId":        br.GetSelectedId(),
+				"selectedDisplay":   br.GetSelectedDisplayText(),
+			}
+			// se desejar manter padrão, reuse sendEventWithWebHook
+			sendEventWithWebHook(mycli, post, "")
+		}
+
+		if lr := evt.Message.GetListResponseMessage(); lr != nil {
+			// ListResponseMessage (SingleSelect)
+			sel := lr.GetSingleSelectReply()
+			post := map[string]interface{}{
+				"type":            "InteractiveReply",
+				"interactiveType": "list",
+				"messageID":       evt.Info.ID,
+				"chat":            evt.Info.Chat.String(),
+				"sender":          evt.Info.Sender.String(),
+				"timestamp":       evt.Info.Timestamp,
+				// campos úteis do proto
+				"listTitle":        lr.GetTitle(),
+				"selectedRowId":    sel.GetSelectedRowId(),
+				"selectedRowTitle": sel.GetTitle(),
+			}
+			sendEventWithWebHook(mycli, post, "")
+		}
 
 		var s3Config struct {
 			Enabled       string `db:"s3_enabled"`
